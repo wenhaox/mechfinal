@@ -15,43 +15,27 @@
 #define MAX_ROBOTS 10
 #define ROBOT_ID 'X'        
 #define RX_TIMEOUT_MS 5
-#define HEADING_MIN_DIST 2  
 
 struct RobotEntry {
   char letter;
   int x;
   int y;
-  float heading;
-  bool hasPrev;
-};
-
-struct HistEntry { 
-  char letter; 
-  int prevX, prevY; 
-  float heading; 
-  bool hasPrev; 
 };
 
 // =====================================================
 // XBee Global Variables
 // =====================================================
-const char robotId = ROBOT_ID;
 bool isRobotRunning = false;
 int matchByte = 0;
-long gameTime = 0;
 int xPos = 0;
 int yPos = 0;
 RobotEntry robots[MAX_ROBOTS];
 int numRobots = 0;
 
-static HistEntry history[MAX_ROBOTS];
-static int numHistory = 0;
 static int prevMatchByte = 0;
 static char rxBuffer[128];
 static int rxIndex = 0;
 static unsigned long lastRxTime = 0;
-static unsigned long validCoords = 0;
-static unsigned long totalResponses = 0;
 
 // =====================================================
 // Pin Definitions & Hardware Objects
@@ -84,14 +68,14 @@ const int     TURN_MIN_SPD       = 70;
 const int     SIG_PUCK         = 1;
 const int     PIXY_CENTER_X    = 158;
 const float   PIXY_PX_PER_DEG  = 5.27;
-const int     PUCK_CENTER_PX   = 40;
-const int     PUCK_EXIT_PX     = 120;
+const int     PUCK_CENTER_PX   = 30;
+const int     PUCK_EXIT_PX     = 60;
 
-const float   PUCK_KP          = 5.0;
+const float   PUCK_KP          = 4;
 const float   PUCK_KI          = 0.5;
 const float   PUCK_KD          = 0.8;
 const float   PUCK_I_LIMIT     = 60.0;
-const int     PUCK_STOP_CM     = 6;
+const float    PUCK_STOP_CM     = 4.0;
 const int16_t SEARCH_SPEED     = 160;
 
 const int GOAL_A_CX   = 55;
@@ -122,21 +106,6 @@ bool          startYLocked     = false;
 // =====================================================
 // XBee Functions (Parsed from broadcast)
 // =====================================================
-static HistEntry* findHistory(char letter) {
-  for (int i = 0; i < numHistory; i++)
-    if (history[i].letter == letter) return &history[i];
-  if (numHistory < MAX_ROBOTS) {
-    HistEntry* e = &history[numHistory++];
-    e->letter = letter;
-    e->prevX = 0;
-    e->prevY = 0;
-    e->heading = 0.0;
-    e->hasPrev = false;
-    return e;
-  }
-  return nullptr;
-}
-
 static int extractDigits(const char* buf, int len, int& pos, int n) {
   int val = 0;
   for (int i = 0; i < n; i++) {
@@ -166,11 +135,9 @@ static bool parseBroadcast(const char* buf) {
   int pos = 1;
   int mBit = extractDigits(buf, len, pos, 1);
   if (mBit < 0) return false;
-  int mTime = extractDigits(buf, len, pos, 4);
-  if (mTime < 0) return false;
+  if (extractDigits(buf, len, pos, 4) < 0) return false;
 
   matchByte = mBit;
-  gameTime = mTime;
 
   int dataEnd = len - 3;
   numRobots = 0;
@@ -184,24 +151,6 @@ static bool parseBroadcast(const char* buf) {
     robots[numRobots].letter = letter;
     robots[numRobots].x = rx;
     robots[numRobots].y = ry;
-    robots[numRobots].heading = 0.0;
-    robots[numRobots].hasPrev = false;
-
-    HistEntry* h = findHistory(letter);
-    if (h) {
-      if (h->hasPrev) {
-        int dx = rx - h->prevX;
-        int dy = ry - h->prevY;
-        if (abs(dx) >= HEADING_MIN_DIST || abs(dy) >= HEADING_MIN_DIST) {
-          h->heading = atan2((float)dy, (float)dx) * 180.0 / M_PI;
-        }
-      }
-      h->prevX = rx;
-      h->prevY = ry;
-      h->hasPrev = true;
-      robots[numRobots].heading = h->heading;
-      robots[numRobots].hasPrev = h->hasPrev;
-    }
 
     numRobots++;
 
@@ -216,10 +165,8 @@ static bool parseBroadcast(const char* buf) {
 static void processMessage() {
   if (rxIndex == 0) return;
   rxBuffer[rxIndex] = '\0';
-  totalResponses++;
 
   if (parseBroadcast(rxBuffer)) {
-    validCoords++;
     if (matchByte == 1 && prevMatchByte == 0) {
       isRobotRunning = true;
       Serial.println(F(">>> START SIGNAL <<<"));
@@ -335,7 +282,7 @@ void executeTurn(float angleDeg) {
   motors.setSpeeds(0, 0);
 }
 
-int readPingCm() {
+float readPingCm() {
   pinMode(PIN_PING, OUTPUT);
   digitalWrite(PIN_PING, LOW);  delayMicroseconds(5);
   digitalWrite(PIN_PING, HIGH); delayMicroseconds(5);
@@ -438,7 +385,7 @@ void driveToWorldPoint(int tx, int ty, int stopDist, bool reaim = true, bool kee
       int bx; long ba;
       bool seen = pixySeePuck(&bx, &ba);
       if (seen) {
-        int offPx = bx - PIXY_CENTER_X;
+        int offPx = PIXY_CENTER_X - bx;
         if (offPx > 0)      puckSearchDir = 1;
         else if (offPx < 0) puckSearchDir = -1;
         float puckErr = offPx / PIXY_PX_PER_DEG;
@@ -468,8 +415,8 @@ void driveToWorldPoint(int tx, int ty, int stopDist, bool reaim = true, bool kee
         motors.setSpeeds(FORWARD_SPEED - corr, FORWARD_SPEED + corr);
       } else {
         //Check for the puck in the blind spot
-        int dist = readPingCm();
-        if (dist > 0 && dist <= (PUCK_STOP_CM + 2)) {
+        float dist = readPingCm();
+        if (dist > 0 && dist <= (PUCK_STOP_CM)) {
             //Yes, goal for goal
             driveStraight(); 
         } else {
@@ -536,7 +483,7 @@ static void approachPuckBlocking() {
     xbeeUpdate();
     int  bx; long ba;
     bool seen = pixySeePuck(&bx, &ba);
-    int  dist = readPingCm();
+    float  dist = readPingCm();
 
     if (driving && dist > 0 && dist <= PUCK_STOP_CM) {
       stopMotors();
@@ -556,7 +503,7 @@ static void approachPuckBlocking() {
       continue;
     }
 
-    int   offPx = bx - PIXY_CENTER_X;
+    int   offPx = PIXY_CENTER_X - bx;
     float err   = offPx / PIXY_PX_PER_DEG;
     if (offPx > 0)      searchDir = 1;
     else if (offPx < 0) searchDir = -1;
@@ -606,6 +553,7 @@ void testDribbleAndShoot() {
 
   approachPuckBlocking();
 
+  /*
   Serial.println(F("PHASE: secure puck"));
   {
     const unsigned long SECURE_PUCK_MS = 250;
@@ -618,6 +566,7 @@ void testDribbleAndShoot() {
     stopMotors();
     delay(80);
   }
+  } */
 
   // ---------------------------------------------------------
   // NEW WAYPOINT LOGIC
