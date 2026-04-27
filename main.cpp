@@ -102,7 +102,7 @@ const unsigned long WALL_BACKUP_MS = 400;
 
 const int     SHOOT_DIST_FIELD = 32;  
 const int     GOAL_BRAKE_DIST_FIELD = 20;
-const int     GOAL_BRAKE_RELEASE_DIST_FIELD = 20;
+const int     GOAL_BRAKE_RELEASE_DIST_FIELD = 24;
 const int16_t GOAL_BRAKE_REVERSE_SPEED = 240;
 const int     GOAL_BRAKE_REVERSE_MS = 500;
 const int     GOAL_BRAKE_SETTLE_MS = 60;
@@ -111,7 +111,7 @@ const int     SHOOT_BURST_MS   = 800;
 const int     REAIM_FIELD      = 80;
 
 const int WAYPOINT_DIST = 20;
-const int SHOOT_WAYPOINT_X_OFFSET = 18;
+const int SHOOT_WAYPOINT_X_OFFSET = 22;
 const int SHOOT_WAYPOINT_X_MARGIN = 18;
 const int RESET_SIDE_X_MARGIN = 24;
 const int RESET_WALL_Y_MARGIN = 20;
