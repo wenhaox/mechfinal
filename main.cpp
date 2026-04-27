@@ -63,12 +63,12 @@ const float   IMU_TURN_KI        = 1.0;
 const float   IMU_TURN_KD        = 0.3;
 const float   IMU_TURN_I_LIMIT   = 100.0;
 const float   TURN_TOLERANCE_DEG = 3.0;
-const int     TURN_MIN_SPD       = 70;
+const int     TURN_MIN_SPD       = 80;
 
 const int     SIG_PUCK         = 1;
 const int     PIXY_CENTER_X    = 158;
 const float   PIXY_PX_PER_DEG  = 5.27;
-const int     PUCK_CENTER_PX   = 30;
+const int     PUCK_CENTER_PX   = 40;
 const int     PUCK_EXIT_PX     = 60;
 
 const float   PUCK_KP          = 4;
@@ -76,20 +76,47 @@ const float   PUCK_KI          = 0.5;
 const float   PUCK_KD          = 0.8;
 const float   PUCK_I_LIMIT     = 60.0;
 const float    PUCK_STOP_CM     = 4.0;
+const float   APPROACH_HEADING_LIMIT_DEG  = 90.0;
+const float   APPROACH_BEHIND_TRIGGER_CM  = 20.0;
 const int16_t SEARCH_SPEED     = 160;
+const int16_t RECOVERY_BACKUP_SPEED = 220;
+const unsigned long BEHIND_PUCK_BACKUP_MS = 180;
+const unsigned long TURN_SEARCH_WALL_TIMEOUT_MS = 500;
+const float   TURN_SEARCH_MIN_YAW_CHANGE_DEG = 10.0;
+const int RESET_WALL_CLEARANCE_MARGIN = 42;
 
 const int GOAL_A_CX   = 55;
 const int GOAL_A_Y    = 3;
 const int GOAL_B_CX   = 55;
 const int GOAL_B_Y    = 230;
 const int FIELD_MID_Y = (GOAL_A_Y + GOAL_B_Y) / 2; 
+const int FIELD_MIN_X = 0;
+const int FIELD_MAX_X = 110;
+const int FIELD_MIN_Y = 0;
+const int FIELD_MAX_Y = 230;
+const int WALL_MARGIN_FIELD = 20;
+const int WALL_STUCK_PROGRESS = 3;
+const int16_t WALL_STUCK_MIN_CMD = 130;
+const unsigned long WALL_STUCK_TIMEOUT_MS = 450;
+const unsigned long WALL_BACKUP_MS = 400;
 
-const int     SHOOT_DIST_FIELD = 30;  
-const int16_t SHOOT_SPEED      = 350; 
-const int     SHOOT_BURST_MS   = 600;
+const int     SHOOT_DIST_FIELD = 32;  
+const int     GOAL_BRAKE_DIST_FIELD = 20;
+const int     GOAL_BRAKE_RELEASE_DIST_FIELD = 20;
+const int16_t GOAL_BRAKE_REVERSE_SPEED = 240;
+const int     GOAL_BRAKE_REVERSE_MS = 500;
+const int     GOAL_BRAKE_SETTLE_MS = 60;
+const int16_t SHOOT_SPEED      = 400; 
+const int     SHOOT_BURST_MS   = 800;
 const int     REAIM_FIELD      = 80;
 
-const int WAYPOINT_DIST = 60;
+const int WAYPOINT_DIST = 20;
+const int SHOOT_WAYPOINT_X_OFFSET = 18;
+const int SHOOT_WAYPOINT_X_MARGIN = 18;
+const int RESET_SIDE_X_MARGIN = 24;
+const int RESET_WALL_Y_MARGIN = 20;
+const int RESET_CORNER_Y_MARGIN = 18;
+const int RESET_GOAL_STOP_DIST = 24;
 
 // =====================================================
 // Robot Navigation State Variables
@@ -102,6 +129,14 @@ float         bootYaw          = 0.0;
 
 int           startY           = -1;
 bool          startYLocked     = false;
+int           targetGoalX      = GOAL_B_CX;
+int           targetGoalY      = GOAL_B_Y;
+int           ownGoalX         = GOAL_A_CX;
+int           ownGoalY         = GOAL_A_Y;
+bool          goalLocked       = false;
+
+void turnTowardWorldPoint(int tx, int ty);
+void driveToWorldPoint(int tx, int ty, int stopDist, bool reaim, bool keepPuck);
 
 // =====================================================
 // XBee Functions (Parsed from broadcast)
@@ -317,25 +352,290 @@ bool pixySeePuck(int* blockX = nullptr, long* blockArea = nullptr) {
 
 void stopMotors() { motors.setSpeeds(0, 0); }
 
+void resetHeadingHold(float targetHeading = NAN) {
+  imuTargetHeading = isnan(targetHeading) ? getYaw() : normalizeAngle(targetHeading);
+  imuPrevError = 0.0;
+  imuIntegral = 0.0;
+  imuPrevMs = millis();
+}
+
+void driveForMs(int16_t leftCmd, int16_t rightCmd, unsigned long durationMs) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < durationMs) {
+    xbeeUpdate();
+    motors.setSpeeds(leftCmd, rightCmd);
+    delay(20);
+  }
+  stopMotors();
+}
+
+bool isNearWall() {
+  return (xPos <= FIELD_MIN_X + WALL_MARGIN_FIELD) ||
+         (xPos >= FIELD_MAX_X - WALL_MARGIN_FIELD) ||
+         (yPos <= FIELD_MIN_Y + WALL_MARGIN_FIELD) ||
+         (yPos >= FIELD_MAX_Y - WALL_MARGIN_FIELD);
+}
+
+bool isNearSideWall() {
+  return (xPos <= FIELD_MIN_X + WALL_MARGIN_FIELD) ||
+         (xPos >= FIELD_MAX_X - WALL_MARGIN_FIELD);
+}
+
+bool maybeRecoverFromWall(int16_t leftCmd, int16_t rightCmd) {
+  static bool trackerInit = false;
+  static int anchorX = 0;
+  static int anchorY = 0;
+  static unsigned long anchorMs = 0;
+
+  unsigned long now = millis();
+  bool translating = ((long)leftCmd * (long)rightCmd > 0) &&
+                     (max(abs(leftCmd), abs(rightCmd)) >= WALL_STUCK_MIN_CMD);
+
+  if (!trackerInit) {
+    anchorX = xPos;
+    anchorY = yPos;
+    anchorMs = now;
+    trackerInit = true;
+    return false;
+  }
+
+  if (!translating || !isNearWall()) {
+    anchorX = xPos;
+    anchorY = yPos;
+    anchorMs = now;
+    return false;
+  }
+
+  long dx = (long)(xPos - anchorX);
+  long dy = (long)(yPos - anchorY);
+  int moved = (int)sqrt((double)(dx * dx + dy * dy));
+  if (moved >= WALL_STUCK_PROGRESS) {
+    anchorX = xPos;
+    anchorY = yPos;
+    anchorMs = now;
+    return false;
+  }
+
+  if (now - anchorMs < WALL_STUCK_TIMEOUT_MS) return false;
+
+  Serial.print(F("RECOVERY: wall backup @ ("));
+  Serial.print(xPos);
+  Serial.print(',');
+  Serial.print(yPos);
+  Serial.println(')');
+
+  driveForMs(-RECOVERY_BACKUP_SPEED, -RECOVERY_BACKUP_SPEED, WALL_BACKUP_MS);
+  resetHeadingHold();
+
+  anchorX = xPos;
+  anchorY = yPos;
+  anchorMs = millis();
+  return true;
+}
+
+bool commandDriveWithRecovery(int16_t leftCmd, int16_t rightCmd) {
+  if (maybeRecoverFromWall(leftCmd, rightCmd)) return true;
+  motors.setSpeeds(leftCmd, rightCmd);
+  return false;
+}
+
+float getGoalHeadingError() {
+  return normalizeAngle(bootYaw - getYaw());
+}
+
+bool shouldGoBehindPuck(float distCm) {
+  if (distCm <= 0 || distCm > APPROACH_BEHIND_TRIGGER_CM) return false;
+  return abs(getGoalHeadingError()) > APPROACH_HEADING_LIMIT_DEG;
+}
+
+int getResetWallY() {
+  return constrain(yPos, FIELD_MIN_Y + RESET_WALL_Y_MARGIN, FIELD_MAX_Y - RESET_WALL_Y_MARGIN);
+}
+
+int getResetCornerY() {
+  if (ownGoalY == GOAL_A_Y) return FIELD_MIN_Y + RESET_CORNER_Y_MARGIN;
+  return FIELD_MAX_Y - RESET_CORNER_Y_MARGIN;
+}
+
+int getResetSideX() {
+  if (xPos <= (FIELD_MIN_X + FIELD_MAX_X) / 2) return FIELD_MAX_X - RESET_SIDE_X_MARGIN;
+  return FIELD_MIN_X + RESET_SIDE_X_MARGIN;
+}
+
+void getResetClearancePoint(int* cx, int* cy) {
+  *cx = xPos;
+  *cy = yPos;
+
+  if (xPos <= FIELD_MIN_X + WALL_MARGIN_FIELD) *cx = FIELD_MIN_X + RESET_WALL_CLEARANCE_MARGIN;
+  else if (xPos >= FIELD_MAX_X - WALL_MARGIN_FIELD) *cx = FIELD_MAX_X - RESET_WALL_CLEARANCE_MARGIN;
+
+  if (yPos <= FIELD_MIN_Y + WALL_MARGIN_FIELD) *cy = FIELD_MIN_Y + RESET_WALL_CLEARANCE_MARGIN;
+  else if (yPos >= FIELD_MAX_Y - WALL_MARGIN_FIELD) *cy = FIELD_MAX_Y - RESET_WALL_CLEARANCE_MARGIN;
+}
+
+bool maybeRecoverSearchTurnFromWall(int8_t& searchDir) {
+  static bool timerInit = false;
+  static unsigned long nearWallMs = 0;
+  static int8_t lastDir = 0;
+  static float startYaw = 0.0f;
+
+  unsigned long now = millis();
+  if (!isNearWall()) {
+    timerInit = false;
+    lastDir = searchDir;
+    return false;
+  }
+
+  if (!timerInit || lastDir != searchDir) {
+    nearWallMs = now;
+    timerInit = true;
+    lastDir = searchDir;
+    startYaw = getYaw();
+    return false;
+  }
+
+  if (now - nearWallMs < TURN_SEARCH_WALL_TIMEOUT_MS) return false;
+
+  float yawDelta = abs(normalizeAngle(getYaw() - startYaw));
+  if (yawDelta >= TURN_SEARCH_MIN_YAW_CHANGE_DEG) {
+    nearWallMs = now;
+    startYaw = getYaw();
+    return false;
+  }
+
+  Serial.print(F("RECOVERY: search turn flip @ ("));
+  Serial.print(xPos);
+  Serial.print(',');
+  Serial.print(yPos);
+  Serial.println(')');
+  Serial.print(F("  yaw change only "));
+  Serial.println(yawDelta, 1);
+
+  searchDir = -searchDir;
+  nearWallMs = millis();
+  lastDir = searchDir;
+  startYaw = getYaw();
+  return true;
+}
+
+void runBadHeadingResetRoute() {
+  int resetSideX = getResetSideX();
+  int resetWallY = getResetWallY();
+  int resetCornerY = getResetCornerY();
+
+  Serial.print(F("APPROACH: heading "));
+  Serial.print(getGoalHeadingError(), 1);
+  Serial.println(F(" deg, running reset route"));
+
+  driveForMs(-RECOVERY_BACKUP_SPEED, -RECOVERY_BACKUP_SPEED, BEHIND_PUCK_BACKUP_MS);
+
+  if (isNearWall()) {
+    int clearX, clearY;
+    getResetClearancePoint(&clearX, &clearY);
+    Serial.print(F("RESET: clearance waypoint=("));
+    Serial.print(clearX);
+    Serial.print(',');
+    Serial.print(clearY);
+    Serial.println(')');
+    turnTowardWorldPoint(clearX, clearY);
+    driveToWorldPoint(clearX, clearY, 18, /*reaim=*/true, /*keepPuck=*/false);
+  }
+
+  Serial.print(F("RESET: wall waypoint=("));
+  Serial.print(resetSideX);
+  Serial.print(',');
+  Serial.print(resetWallY);
+  Serial.println(')');
+  turnTowardWorldPoint(resetSideX, resetWallY);
+  driveToWorldPoint(resetSideX, resetWallY, 25, /*reaim=*/true, /*keepPuck=*/false);
+
+  Serial.print(F("RESET: corner waypoint=("));
+  Serial.print(resetSideX);
+  Serial.print(',');
+  Serial.print(resetCornerY);
+  Serial.println(')');
+  turnTowardWorldPoint(resetSideX, resetCornerY);
+  driveToWorldPoint(resetSideX, resetCornerY, 25, /*reaim=*/true, /*keepPuck=*/false);
+
+  Serial.print(F("RESET: own goal center=("));
+  Serial.print(ownGoalX);
+  Serial.print(',');
+  Serial.print(ownGoalY);
+  Serial.println(')');
+  turnTowardWorldPoint(ownGoalX, ownGoalY);
+  driveToWorldPoint(ownGoalX, ownGoalY, RESET_GOAL_STOP_DIST, /*reaim=*/true, /*keepPuck=*/false);
+
+  Serial.println(F("RESET: re-face shooting goal"));
+  turnTowardWorldPoint(targetGoalX, targetGoalY);
+  resetHeadingHold(bootYaw);
+}
+
 int16_t driveStraight() {
   int16_t corr = getHeadingCorrection();
-  motors.setSpeeds(FORWARD_SPEED - corr, FORWARD_SPEED + corr);
+  commandDriveWithRecovery(FORWARD_SPEED - corr, FORWARD_SPEED + corr);
   return corr;
 }
 
 void getOpponentGoal(int* gx, int* gy) {
-  int refY = startYLocked ? startY : yPos;
-  if (refY < FIELD_MID_Y) {
-    *gx = GOAL_B_CX;  *gy = GOAL_B_Y;
-  } else {
-    *gx = GOAL_A_CX;  *gy = GOAL_A_Y;
+  *gx = targetGoalX;
+  *gy = targetGoalY;
+}
+
+bool getOtherRobotPosition(int* ox, int* oy) {
+  for (int i = 0; i < numRobots; i++) {
+    if (robots[i].letter == ROBOT_ID) continue;
+    *ox = robots[i].x;
+    *oy = robots[i].y;
+    return true;
   }
+  return false;
+}
+
+void getShotSetupWaypoint(int gx, int gy, int* wx, int* wy) {
+  *wy = (gy == GOAL_A_Y) ? (GOAL_A_Y + WAYPOINT_DIST)
+                         : (GOAL_B_Y - WAYPOINT_DIST);
+  *wx = gx;
+
+  int ox, oy;
+  if (!getOtherRobotPosition(&ox, &oy)) return;
+
+  if (ox <= gx) *wx = gx + SHOOT_WAYPOINT_X_OFFSET;
+  else          *wx = gx - SHOOT_WAYPOINT_X_OFFSET;
+  *wx = constrain(*wx, FIELD_MIN_X + SHOOT_WAYPOINT_X_MARGIN,
+                       FIELD_MAX_X - SHOOT_WAYPOINT_X_MARGIN);
+
+  Serial.print(F(">>> opponent=("));
+  Serial.print(ox);
+  Serial.print(',');
+  Serial.print(oy);
+  Serial.print(F(") setup waypoint=("));
+  Serial.print(*wx);
+  Serial.print(',');
+  Serial.print(*wy);
+  Serial.println(')');
 }
 
 int distanceToPoint(int tx, int ty) {
   long dx = (long)(tx - xPos);
   long dy = (long)(ty - yPos);
   return (int)sqrt((double)(dx*dx + dy*dy));
+}
+
+void brakeBeforeGoal(int gx, int gy) {
+  Serial.println(F("PHASE: brake before goal"));
+  stopMotors();
+  delay(GOAL_BRAKE_SETTLE_MS);
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < GOAL_BRAKE_REVERSE_MS) {
+    xbeeUpdate();
+    int distToGoal = distanceToPoint(gx, gy);
+    if (distToGoal >= GOAL_BRAKE_RELEASE_DIST_FIELD) break;
+
+    motors.setSpeeds(-GOAL_BRAKE_REVERSE_SPEED, -GOAL_BRAKE_REVERSE_SPEED);
+    delay(20);
+  }
+  stopMotors();
 }
 
 float worldPointToYaw(int tx, int ty) {
@@ -345,6 +645,34 @@ float worldPointToYaw(int tx, int ty) {
   if (refY >= FIELD_MID_Y) { dx = -dx; dy = -dy; }
   float relYaw = atan2((float)dx, (float)dy) * 180.0 / PI;
   return normalizeAngle(bootYaw + relYaw); 
+}
+
+void lockGoalsFromBootFacing() {
+  float errA = abs(normalizeAngle(worldPointToYaw(GOAL_A_CX, GOAL_A_Y) - bootYaw));
+  float errB = abs(normalizeAngle(worldPointToYaw(GOAL_B_CX, GOAL_B_Y) - bootYaw));
+
+  if (errA <= errB) {
+    targetGoalX = GOAL_A_CX;
+    targetGoalY = GOAL_A_Y;
+    ownGoalX = GOAL_B_CX;
+    ownGoalY = GOAL_B_Y;
+  } else {
+    targetGoalX = GOAL_B_CX;
+    targetGoalY = GOAL_B_Y;
+    ownGoalX = GOAL_A_CX;
+    ownGoalY = GOAL_A_Y;
+  }
+  goalLocked = true;
+
+  Serial.print(F(">>> target goal locked = ("));
+  Serial.print(targetGoalX);
+  Serial.print(',');
+  Serial.print(targetGoalY);
+  Serial.print(F(") own goal = ("));
+  Serial.print(ownGoalX);
+  Serial.print(',');
+  Serial.print(ownGoalY);
+  Serial.println(')');
 }
 
 void turnTowardWorldPoint(int tx, int ty) {
@@ -411,8 +739,11 @@ void driveToWorldPoint(int tx, int ty, int stopDist, bool reaim = true, bool kee
 
         int16_t headingCorr = getHeadingCorrection();
         int16_t corr = constrain((int16_t)(headingCorr + puckBias), (int16_t)-MAX_IMU_CORRECTION, (int16_t) MAX_IMU_CORRECTION);
-
-        motors.setSpeeds(FORWARD_SPEED - corr, FORWARD_SPEED + corr);
+        if (commandDriveWithRecovery(FORWARD_SPEED - corr, FORWARD_SPEED + corr)) {
+          puckPidInit = false;
+          puckIntegral = 0.0;
+          continue;
+        }
       } else {
         //Check for the puck in the blind spot
         float dist = readPingCm();
@@ -487,7 +818,7 @@ static void approachPuckBlocking() {
 
     if (driving && dist > 0 && dist <= PUCK_STOP_CM) {
       stopMotors();
-      imuTargetHeading = getYaw();
+      resetHeadingHold();
 
       Serial.print(F("  at puck, dist=")); Serial.print(dist);
       Serial.print(F(" cm yaw=")); Serial.println(getYaw(), 1);
@@ -495,6 +826,13 @@ static void approachPuckBlocking() {
     }
 
     if (!seen) {
+      if (maybeRecoverSearchTurnFromWall(searchDir)) {
+        centered = false;
+        driving = false;
+        pidInit = false; integral = 0;
+        delay(10);
+        continue;
+      }
       spinSearchByDir(searchDir);
       centered = false;
       driving = false;
@@ -515,12 +853,29 @@ static void approachPuckBlocking() {
       Serial.print(F("ALIGN done, yaw=")); Serial.println(getYaw(), 1);
     }
 
+    if (driving && shouldGoBehindPuck(dist)) {
+      runBadHeadingResetRoute();
+      centered = false;
+      driving = false;
+      pidInit = false;
+      integral = 0.0;
+      delay(10);
+      continue;
+    }
+
     if (!driving) {
       int16_t spd = applyFrictionKick(puckPidStep(err, TURN_SPEED, prevErr, integral, prevMs, pidInit));
       motors.setSpeeds(-spd, spd);
     } else {
       int16_t bias = puckPidStep(err, MAX_IMU_CORRECTION, prevErr, integral, prevMs, pidInit);
-      motors.setSpeeds(FORWARD_SPEED - bias, FORWARD_SPEED + bias);
+      if (commandDriveWithRecovery(FORWARD_SPEED - bias, FORWARD_SPEED + bias)) {
+        centered = false;
+        driving = false;
+        pidInit = false;
+        integral = 0.0;
+        delay(10);
+        continue;
+      }
     }
     delay(10);
   }
@@ -534,7 +889,7 @@ static void approachPuckBlocking() {
 // =====================================================
 void testDribbleAndShoot() {
   Serial.println(F("TEST: dribble and shoot"));
-  Serial.println(F("(place robot facing opponent goal at boot)"));
+  Serial.println(F("(place robot facing the goal you want to shoot at)"));
 
   Serial.println(F("Waiting for XBee position..."));
   while (xPos == 0 && yPos == 0) {
@@ -571,14 +926,8 @@ void testDribbleAndShoot() {
   // ---------------------------------------------------------
   // NEW WAYPOINT LOGIC
   // ---------------------------------------------------------
-  int waypointX = gx;
-  int waypointY;
-  
-  if (gy == GOAL_A_Y) {
-    waypointY = GOAL_A_Y + WAYPOINT_DIST; 
-  } else {
-    waypointY = GOAL_B_Y - WAYPOINT_DIST; 
-  }
+  int waypointX, waypointY;
+  getShotSetupWaypoint(gx, gy, &waypointX, &waypointY);
 
   Serial.println(F("PHASE: drive to setup waypoint"));
   turnTowardWorldPoint(waypointX, waypointY);
@@ -594,26 +943,24 @@ void testDribbleAndShoot() {
   Serial.println(F("PHASE: final drive to goal"));
   driveToWorldPoint(gx, gy, SHOOT_DIST_FIELD, /*reaim=*/true, /*keepPuck=*/true);
 
-  Serial.println(F("PHASE: Smart drive into goal"));
+  Serial.println(F("PHASE: final re-aim to goal"));
+  turnTowardWorldPoint(gx, gy);
+
+  Serial.println(F("PHASE: controlled final push"));
   
   while (true) {
     xbeeUpdate();
-    
-    // Find breaking zone
     int distToGoal = distanceToPoint(gx, gy);
-    
-    if (distToGoal <= 20) {
+
+    if (distToGoal <= GOAL_BRAKE_DIST_FIELD) {
       break; 
     }
-    
+
     driveStraight(); 
     delay(20);
   }
 
-  // Goal break
-  motors.setSpeeds(-250, -250);
-  delay(80);
-  stopMotors();
+  brakeBeforeGoal(gx, gy);
 
   Serial.println(F("TEST: done"));
 }
@@ -673,18 +1020,19 @@ void setup() {
   bootYaw          = getYaw();
   imuTargetHeading = bootYaw;
   imuPrevMs        = millis();
+  lockGoalsFromBootFacing();
   Serial.print(F(">>> START — bootYaw locked = "));
   Serial.print(bootYaw, 1);
-  Serial.println(F(" (this yaw == facing opponent goal)"));
+  Serial.println(F(" (this yaw == locked shooting direction)"));
 
-  testDribbleAndShoot();  
+  
 
   Serial.println(F("Setup done. Loop running."));
 }
 
 void loop() {
   xbeeUpdate();
-
+  testDribbleAndShoot();  
   if (!isRobotRunning) {
     stopMotors();
     delay(50);
