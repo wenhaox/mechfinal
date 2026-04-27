@@ -111,7 +111,7 @@ const int     SHOOT_BURST_MS   = 800;
 const int     REAIM_FIELD      = 80;
 
 const int WAYPOINT_DIST = 20;
-const int SHOOT_WAYPOINT_X_OFFSET = 18;
+const int SHOOT_WAYPOINT_X_OFFSET = 22;
 const int SHOOT_WAYPOINT_X_MARGIN = 18;
 const int RESET_SIDE_X_MARGIN = 24;
 const int RESET_WALL_Y_MARGIN = 20;
